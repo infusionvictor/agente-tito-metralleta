@@ -167,7 +167,7 @@ Diseño propuesto (a confirmar):
 
 ---
 
-## 7. Eststructura técnica (para quien lea el código)
+## 7. Estructura técnica (para quien lea el código)
 
 - `web/lib/marketsnack.ts` — cliente de MarketSnack (flujo, filtros, cookie).
 - `web/lib/flow.ts` — clasificación de trades + flags + score de agresividad (funciones puras, con tests).
