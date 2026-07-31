@@ -68,10 +68,7 @@ export async function fetchOptionChain(
 
   while (url) {
     page += 1;
-    const res: Response = await fetch(url, {
-      headers: { Authorization: `Bearer ${key}` },
-      cache: "no-store",
-    });
+    const res: Response = await fetchMassive(url, key);
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -101,6 +98,9 @@ export async function fetchOptionChain(
       break;
     }
     url = json.next_url ?? null;
+    // Pausa entre páginas: espacia las llamadas para no reventar el límite/min
+    // de Massive en cadenas grandes (SPY pagina muchas veces).
+    if (url) await new Promise((r) => setTimeout(r, 200));
   }
 
   return { contracts, underlyingPrice, pages: page, truncated };
@@ -126,12 +126,31 @@ interface StockSnapshot {
   prevDay?: { c?: number };
 }
 
+// Cliente HTTP compartido con REINTENTO ante 429: el plan de Massive limita por
+// minuto, y una página con 429 no debe tirar toda la operación. Espera y
+// reintenta (respeta Retry-After si viene; si no, backoff exponencial).
+async function fetchMassive(url: string, key: string): Promise<Response> {
+  const maxAttempts = 4;
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${key}` },
+      cache: "no-store",
+    });
+    if (res.status === 429 && attempt < maxAttempts) {
+      const retryAfter = Number(res.headers.get("retry-after"));
+      const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : 1500 * 2 ** (attempt - 1); // 1.5s → 3s → 6s
+      await new Promise((r) => setTimeout(r, waitMs));
+      continue;
+    }
+    return res;
+  }
+}
+
 async function getJson<T>(path: string): Promise<T | null> {
   const key = apiKey();
-  const res = await fetch(`${BASE_URL}${path}`, {
-    headers: { Authorization: `Bearer ${key}` },
-    cache: "no-store",
-  });
+  const res = await fetchMassive(`${BASE_URL}${path}`, key);
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -282,6 +301,10 @@ interface WheelRawContract {
   details?: { strike_price?: number; expiration_date?: string; contract_type?: string };
   last_quote?: { bid?: number; ask?: number };
   last_trade?: { price?: number };
+  // Agregado diario del contrato. Massive dejó de exponer last_quote/last_trade
+  // en este plan, pero sigue mandando `day` — su close es el último precio
+  // (retrasado) del put, respaldo para la prima cuando MarketSnack no cotiza.
+  day?: { close?: number; vwap?: number };
   open_interest?: number;
   underlying_asset?: { price?: number };
 }
@@ -328,7 +351,7 @@ export async function fetchWheelChain(
       dte,
       bid: c.last_quote?.bid ?? null,
       ask: c.last_quote?.ask ?? null,
-      lastTrade: c.last_trade?.price ?? null,
+      lastTrade: c.last_trade?.price ?? c.day?.close ?? c.day?.vwap ?? null,
       openInterest: c.open_interest ?? 0,
     });
   }

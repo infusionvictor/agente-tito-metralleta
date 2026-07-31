@@ -5,6 +5,8 @@
 // asequibilidad se calcula en el cliente con tito.risk.* de localStorage.
 
 import { fetchWheelChain } from "@/lib/massive";
+import { fetchFlow } from "@/lib/marketsnack";
+import { liveQuoteMap, liveKey } from "@/lib/wheelLive";
 import { cachedDailyBars } from "@/lib/barsStore";
 import { findLevels, type LvlBar } from "@/lib/levels";
 import { realizedVolSeries, rankWithin } from "@/lib/ivcontext";
@@ -19,7 +21,10 @@ import type { WheelSseEvent } from "@/app/wheel/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const CONCURRENCY = 6;
+// Concurrencia baja a propósito: el plan de Massive limita las peticiones por
+// minuto. Con el retry/backoff de getJson, 2 en vuelo escanea sin reventar el
+// límite (a cambio de tardar más; el SSE va mostrando el progreso).
+const CONCURRENCY = 2;
 
 function sse(event: WheelSseEvent): string {
   return `data: ${JSON.stringify(event)}\n\n`;
@@ -61,18 +66,46 @@ export async function GET(req: Request) {
 
         await mapLimit(WHEEL_UNIVERSE, CONCURRENCY, async (sym) => {
           try {
+            // Precio de la acción: del histórico diario. Massive dejó de mandar
+            // el spot en el snapshot de opciones (underlying_asset sin price).
+            const bars = await cachedDailyBars(sym.ticker, 365, now);
+            const spot = bars.length > 0 ? bars[bars.length - 1].close : null;
+            if (spot == null || !(spot > 0)) {
+              failed++;
+              send({ type: "step", label: `${sym.ticker}: sin precio` });
+              return;
+            }
+
             const chain = await fetchWheelChain(sym.ticker, {
               dteMin: preset.dteMin, dteMax: preset.dteMax, now,
             });
-            if (chain.spot == null || chain.quotes.length === 0) {
+            // Solo puts OTM (colateral razonable y son los de la Wheel).
+            let quotes = chain.quotes.filter((q) => q.strike <= spot);
+            if (quotes.length === 0) {
               failed++;
               send({ type: "step", label: `${sym.ticker}: sin cadena` });
               return;
             }
 
-            const bars = await cachedDailyBars(sym.ticker, 365, now);
+            // Overlay de bid/ask EN VIVO de MarketSnack donde ese put operó.
+            // Massive ya no trae horquilla; sin un bid real la salvaguarda de
+            // liquidez bloquea todo. Best-effort: si MarketSnack falla (cookie o
+            // límite), se degrada a Massive y esos strikes quedan sin bid.
+            try {
+              const flow = await fetchFlow(sym.ticker, { period: "5d", maxPages: 2 });
+              const live = liveQuoteMap(flow.trades);
+              if (live.size > 0) {
+                quotes = quotes.map((q) => {
+                  const lq = live.get(liveKey(q.strike, q.expiration));
+                  return lq ? { ...q, bid: lq.bid, ask: lq.ask } : q;
+                });
+              }
+            } catch {
+              // MarketSnack no disponible: se sigue con Massive (sin bid en vivo).
+            }
+
             const lvlBars: LvlBar[] = bars.map((b) => ({ time: b.time, high: b.high, low: b.low, close: b.close }));
-            const levels = findLevels({ bars: lvlBars, spot: chain.spot, now });
+            const levels = findLevels({ bars: lvlBars, spot, now });
 
             // IV Rank propio: proxy de volatilidad realizada (no hay serie de IV).
             const rvSeries = realizedVolSeries(bars.map((b) => b.close), 30);
@@ -85,14 +118,14 @@ export async function GET(req: Request) {
             // símbolo aquí), así que la confirmación por skew de earningsFlag
             // ("dentro_confirmado") queda pendiente y hoy nunca dispara; ver
             // la nota en lib/earnings.ts (earningsForTicker).
-            const nearExp = chain.quotes.reduce((a, b) => (b.dte < a.dte ? b : a)).expiration;
+            const nearExp = quotes.reduce((a, b) => (b.dte < a.dte ? b : a)).expiration;
             const earnings = await earningsForTicker({
               ticker: sym.ticker, expiration: nearExp, frontSkew: null, now,
             });
 
             const fallbackIv = currentRv != null ? currentRv / 100 : 0.4;
             const cands = wheelCandidates({
-              ticker: sym.ticker, spot: chain.spot, quotes: chain.quotes,
+              ticker: sym.ticker, spot, quotes,
               preset, ivRank, supports: levels.supports, earnings, fallbackIv,
             });
             all.push(...cands);

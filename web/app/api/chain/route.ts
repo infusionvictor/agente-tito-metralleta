@@ -13,6 +13,13 @@ function sse(event: ChainEvent): string {
   return `data: ${JSON.stringify(event)}\n\n`;
 }
 
+// Caché read-through en memoria (por proceso). La cadena cambia poco intradía y
+// el plan de Massive limita fuerte; re-paginar 40 páginas en cada visita es lo
+// que hacía la app lenta. Guardamos los eventos finales por ticker y los
+// servimos al instante mientras estén frescos.
+const CHAIN_TTL_MS = 10 * 60 * 1000;
+const chainCache = new Map<string, { at: number; events: ChainEvent[] }>();
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const ticker = (searchParams.get("ticker") ?? "").trim().toUpperCase();
@@ -27,7 +34,15 @@ export async function GET(request: Request) {
       try {
         if (!ticker) {
           send({ type: "error", message: "Escribe un ticker (p. ej. AAPL)." });
-          controller.close();
+          return;
+        }
+
+        // Cache hit: servir al instante sin re-consultar Massive.
+        const cached = chainCache.get(ticker);
+        if (cached && Date.now() - cached.at < CHAIN_TTL_MS) {
+          const mins = Math.round((Date.now() - cached.at) / 60000);
+          send({ type: "step", label: `Cadena en caché de ${ticker} (hace ${mins} min)…` });
+          for (const e of cached.events) send(e);
           return;
         }
 
@@ -50,7 +65,6 @@ export async function GET(request: Request) {
 
         if (contracts.length === 0) {
           send({ type: "error", message: `Sin contratos para "${ticker}".` });
-          controller.close();
           return;
         }
 
@@ -87,7 +101,13 @@ export async function GET(request: Request) {
           pages,
           truncated,
         };
-        send({ type: "done", rows, meta, structure, history });
+        const doneEvent: ChainEvent = { type: "done", rows, meta, structure, history };
+        // Guardar en caché los eventos que un cache-hit debe reproducir (company + done).
+        chainCache.set(ticker, {
+          at: Date.now(),
+          events: [{ type: "company", company }, doneEvent],
+        });
+        send(doneEvent);
       } catch (err) {
         const message =
           err instanceof MassiveError

@@ -46,6 +46,7 @@ function WheelRow({ c, view }: { c: AffordableCandidate; view: "estudiante" | "p
           {c.blockReason === "sin_bid" && "Nadie está poniendo precio de compra: no podrías vender."}
           {c.blockReason === "spread_ancho" && "La horquilla es demasiado ancha: perderías dinero al entrar."}
           {c.blockReason === "oi_bajo" && "Muy pocos contratos abiertos: no hay con quién operar."}
+          {c.blockReason === "sin_dato" && "Sin precio ni horquilla del proveedor: no hay con qué calcular la prima."}
         </p>
       </div>
     );
