@@ -16,9 +16,6 @@
 
 set -uo pipefail
 
-# launchd arranca con un PATH mínimo que no incluye ~/.local/bin, donde vive `claude`.
-export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-
 API="http://localhost:3000/api/watchlist"
 BROKER="robinhood"
 MAX_POR_PASE=10
