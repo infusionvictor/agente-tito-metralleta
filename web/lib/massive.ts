@@ -156,6 +156,31 @@ export async function fetchCompany(ticker: string): Promise<CompanyInfo> {
   const t = snap?.ticker ?? {};
   const exchangeCode = d.primary_exchange;
 
+  // Precio del subyacente. El snapshot en vivo (`/v2/snapshot/...`) requiere el plan
+  // de Stocks; si no está disponible (403 → snap null), caemos al cierre previo, que
+  // sí entra en el plan gratis. Así la app funciona con o sin el plan de Stocks.
+  let price = t.day?.c ?? t.min?.c ?? t.prevDay?.c ?? null;
+  let dayOpen = t.day?.o ?? null;
+  let dayHigh = t.day?.h ?? null;
+  let dayLow = t.day?.l ?? null;
+  let dayVolume = t.day?.v ?? null;
+  let prevClose = t.prevDay?.c ?? null;
+
+  if (price == null) {
+    const prev = await getJson<{ results?: AggBar[] }>(
+      `/v2/aggs/ticker/${encodeURIComponent(clean)}/prev?adjusted=true`,
+    ).catch(() => null);
+    const p = prev?.results?.[0];
+    if (p) {
+      price = p.c ?? null;
+      dayOpen = p.o ?? null;
+      dayHigh = p.h ?? null;
+      dayLow = p.l ?? null;
+      dayVolume = p.v ?? null;
+      prevClose = p.c ?? null;
+    }
+  }
+
   return {
     ticker: clean,
     name: d.name ?? null,
@@ -167,14 +192,14 @@ export async function fetchCompany(ticker: string): Promise<CompanyInfo> {
     sector: d.sic_description ?? null,
     description: d.description ?? null,
     hasLogo: Boolean(d.branding?.logo_url || d.branding?.icon_url),
-    price: t.day?.c ?? t.min?.c ?? t.prevDay?.c ?? null,
+    price,
     change: t.todaysChange ?? null,
     changePercent: t.todaysChangePerc ?? null,
-    dayOpen: t.day?.o ?? null,
-    dayHigh: t.day?.h ?? null,
-    dayLow: t.day?.l ?? null,
-    dayVolume: t.day?.v ?? null,
-    prevClose: t.prevDay?.c ?? null,
+    dayOpen,
+    dayHigh,
+    dayLow,
+    dayVolume,
+    prevClose,
   };
 }
 
@@ -184,6 +209,7 @@ interface AggBar {
   h: number;
   l: number;
   c: number;
+  v?: number;
 }
 
 function toDateStr(ms: number): string {
