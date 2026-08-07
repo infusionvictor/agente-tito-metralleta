@@ -46,8 +46,12 @@ export interface IdeasMeta {
     vencido: number;
     sin_theta: number;
     no_inusual: number;
+    /** Strike demasiado lejos del precio (fuera de la banda de cercanía). */
+    lejano: number;
   };
   minPremium: number;
+  /** Banda de cercanía del strike al precio, |strike − spot| / spot. */
+  moneynessCap: number;
   period: string;
   generatedAt: string;
 }

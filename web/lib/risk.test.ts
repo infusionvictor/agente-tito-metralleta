@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_THETA_PCT_DAILY,
   MIN_DTE,
+  MONEYNESS_CAP,
   THETA_BUDGET_PCT,
   budgetsOf,
   passesQualityFilter,
   sizeFlow,
+  withinMoneyness,
   type RiskProfile,
 } from "./risk";
 import type { FlowRow } from "./flow";
@@ -182,6 +184,38 @@ describe("sizeFlow — salvaguardas (regla de CLAUDE.md)", () => {
     const s = sizeFlow(row({ thetaPctDaily: null, theta: 0 }), PROFILE, 20);
     expect(s.blocked?.reason).toBe("sin_theta");
     expect(s.maxContracts).toBe(0);
+  });
+});
+
+describe("withinMoneyness — contratos más cercanos", () => {
+  it("acepta un strike pegado al precio (ATM)", () => {
+    expect(withinMoneyness(row({ strike: 210, assetPrice: 210 }))).toBe(true);
+  });
+
+  it("acepta dentro de la banda y rechaza justo fuera", () => {
+    // banda por defecto ±25% sobre spot 200 → hasta 250 dentro, 251 fuera
+    expect(withinMoneyness(row({ strike: 250, assetPrice: 200 }))).toBe(true);
+    expect(withinMoneyness(row({ strike: 251, assetPrice: 200 }))).toBe(false);
+  });
+
+  it("rechaza lo muy OTM (lotería barata) y lo muy ITM (caro)", () => {
+    expect(withinMoneyness(row({ strike: 400, assetPrice: 200 }))).toBe(false); // +100%
+    expect(withinMoneyness(row({ strike: 80, assetPrice: 200 }))).toBe(false); // −60%
+  });
+
+  it("respeta una banda personalizada", () => {
+    expect(withinMoneyness(row({ strike: 220, assetPrice: 200 }), 0.05)).toBe(false);
+    expect(withinMoneyness(row({ strike: 220, assetPrice: 200 }), 0.15)).toBe(true);
+  });
+
+  it("con datos faltantes no filtra: la cercanía es preferencia, no salvaguarda", () => {
+    expect(withinMoneyness(row({ strike: null }))).toBe(true);
+    expect(withinMoneyness(row({ assetPrice: 0 }))).toBe(true);
+  });
+
+  it("MONEYNESS_CAP es una fracción razonable (0-1)", () => {
+    expect(MONEYNESS_CAP).toBeGreaterThan(0);
+    expect(MONEYNESS_CAP).toBeLessThanOrEqual(1);
   });
 });
 

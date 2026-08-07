@@ -418,8 +418,9 @@ export default function IdeasPage() {
                   El filtro de calidad tumbó{" "}
                   <strong>{meta.rejected.theta_alto}</strong> contratos por theta alto (lotería),{" "}
                   <strong>{meta.rejected.vencido}</strong> por vencer demasiado pronto,{" "}
-                  <strong>{meta.rejected.sin_theta}</strong> sin theta en el feed y{" "}
-                  <strong>{meta.rejected.no_inusual}</strong> por no ser flujo inusual.
+                  <strong>{meta.rejected.sin_theta}</strong> sin theta en el feed,{" "}
+                  <strong>{meta.rejected.no_inusual}</strong> por no ser flujo inusual y{" "}
+                  <strong>{meta.rejected.lejano}</strong> por tener el strike lejos del precio.
                 </p>
               )}
             </div>

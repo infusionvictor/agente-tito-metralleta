@@ -10,7 +10,7 @@
 //
 // Funciones puras: reciben el FlowRow ya clasificado y el perfil, no tocan red ni disco.
 
-import { UNUSUAL_TRADE_THRESHOLD, unusualTradeScore, type FlowRow } from "./flow";
+import { unusualTradeScore, type FlowRow } from "./flow";
 
 /** Perfil del usuario. Vive en localStorage: el saldo nunca llega al servidor. */
 export interface RiskProfile {
@@ -38,8 +38,28 @@ export const MAX_THETA_PCT_DAILY = 5;
  */
 export const THETA_BUDGET_PCT = 5;
 
-/** Días mínimos al vencimiento para que valga la pena mirarlo. */
-export const MIN_DTE = 7;
+/**
+ * Días mínimos al vencimiento para que valga la pena mirarlo. Bajo a propósito
+ * (contratos "más cercanos"): permite semanales/near-term, pero sigue tumbando
+ * los 0DTE / "expira_hoy" —que van por `expiryStatus`— por ser pura lotería.
+ */
+export const MIN_DTE = 2;
+
+/**
+ * Umbral de inusualidad SOLO para el screener de ideas (`isTradeableIdea`).
+ * Más laxo que el institucional (`UNUSUAL_TRADE_THRESHOLD = 7` en flow.ts, que
+ * define el scorecard): con un piso de premium más bajo, el puntaje de tamaño ya
+ * no basta para llegar a 7, así que aquí basta con un 5 para dejar pasar flujo
+ * direccional de tamaño mediano. No toca la definición institucional del dashboard.
+ */
+export const IDEA_UNUSUAL_THRESHOLD = 5;
+
+/**
+ * Cercanía máxima del strike al precio del subyacente, |strike − spot| / spot.
+ * Contratos "más cercanos": descarta lo muy OTM (lotería barata) y lo muy ITM
+ * (caro y sin apalancamiento). 0.25 = dentro del ±25% del precio actual.
+ */
+export const MONEYNESS_CAP = 0.25;
 
 /** Un contrato son 100 acciones. */
 const MULTIPLIER = 100;
@@ -120,12 +140,24 @@ export function passesQualityFilter(row: FlowRow): QualityResult {
   return { ok: true };
 }
 
-/** ¿El flow merece salir en el screener? Capa 1 + el umbral de inusualidad del scorecard. */
+/** ¿El flow merece salir en el screener? Capa 1 + el umbral de inusualidad del screener. */
 export function isTradeableIdea(row: FlowRow): boolean {
   return (
     passesQualityFilter(row).ok &&
-    unusualTradeScore(row).total >= UNUSUAL_TRADE_THRESHOLD
+    unusualTradeScore(row).total >= IDEA_UNUSUAL_THRESHOLD
   );
+}
+
+/**
+ * ¿El strike está cerca del precio actual? Filtro de "contratos más cercanos".
+ * Ante datos faltantes (sin strike o sin precio del subyacente) NO filtra: la
+ * cercanía es una preferencia, no una salvaguarda, así que no tira filas por
+ * falta de datos.
+ */
+export function withinMoneyness(row: FlowRow, cap = MONEYNESS_CAP): boolean {
+  const spot = safe(row.assetPrice);
+  if (spot === 0 || row.strike == null) return true;
+  return Math.abs(row.strike - spot) / spot <= cap;
 }
 
 function blockedSizing(reason: BlockReason, detail: string): Sizing {
