@@ -159,6 +159,16 @@ async function getJson<T>(path: string): Promise<T | null> {
   return (await res.json()) as T;
 }
 
+/**
+ * Primer valor POSITIVO de una lista. Massive devuelve `day.c = 0` (no null) temprano en
+ * la sesión o por límites del plan, y `x ?? y` NO salta el 0 → mostraba precio $0 o el
+ * cierre de ayer. Este helper salta null/undefined Y ceros, así que toma el precio real.
+ */
+function primerPositivo(...xs: Array<number | null | undefined>): number | null {
+  for (const x of xs) if (typeof x === "number" && x > 0) return x;
+  return null;
+}
+
 /** Detalles de referencia + snapshot de precio, combinados en CompanyInfo. */
 export async function fetchCompany(ticker: string): Promise<CompanyInfo> {
   const clean = ticker.trim().toUpperCase();
@@ -175,6 +185,12 @@ export async function fetchCompany(ticker: string): Promise<CompanyInfo> {
   const t = snap?.ticker ?? {};
   const exchangeCode = d.primary_exchange;
 
+  // Precio actual (positivo, más fresco) y cierre de ayer, para derivar el cambio
+  // nosotros mismos: el `todaysChange` de Massive se apoya en `day.c` (a veces 0) y salía mal.
+  const px = primerPositivo(t.min?.c, t.day?.c, t.prevDay?.c);
+  const prevC = primerPositivo(t.prevDay?.c);
+  const derivable = px != null && prevC != null;
+
   return {
     ticker: clean,
     name: d.name ?? null,
@@ -186,9 +202,11 @@ export async function fetchCompany(ticker: string): Promise<CompanyInfo> {
     sector: d.sic_description ?? null,
     description: d.description ?? null,
     hasLogo: Boolean(d.branding?.logo_url || d.branding?.icon_url),
-    price: t.day?.c ?? t.min?.c ?? t.prevDay?.c ?? null,
-    change: t.todaysChange ?? null,
-    changePercent: t.todaysChangePerc ?? null,
+    // Preferir el precio intradía más fresco y POSITIVO: último minuto → cierre del día →
+    // cierre de ayer. (min.c suele ser lo más actual; day.c a veces llega en 0.)
+    price: px,
+    change: derivable ? px - prevC : t.todaysChange ?? null,
+    changePercent: derivable && prevC > 0 ? ((px - prevC) / prevC) * 100 : t.todaysChangePerc ?? null,
     dayOpen: t.day?.o ?? null,
     dayHigh: t.day?.h ?? null,
     dayLow: t.day?.l ?? null,
