@@ -2,6 +2,8 @@
 // Auth por cookie de sesión (MARKETSNACK_COOKIE en .env.local). Ver SCOREDCARD/Scoredcard.md.
 
 import type { RawTrade } from "./flow";
+import type { RawContract } from "./types";
+import { parseOcc, marketDateStr } from "./occ";
 
 const BASE_URL = "https://app.marketsnack.com";
 
@@ -58,6 +60,145 @@ export async function fetchFlow(
  */
 export async function fetchMarketFlow(opts: FetchFlowOptions = {}): Promise<FlowResult> {
   return paginate(null, opts);
+}
+
+export interface FlowChainResult {
+  contracts: RawContract[];
+  underlyingPrice: number | null;
+  pages: number;
+  truncated: boolean;
+}
+
+/**
+ * Reconstruye una option chain a partir del flujo (Time & Sales) de MarketSnack,
+ * con la MISMA forma que `fetchOptionChain` de Massive, para usarse como respaldo
+ * cuando el plan de Massive ya no autoriza el snapshot de opciones (403).
+ *
+ * Diferencia clave vs. Massive: aquí solo aparecen contratos que **operaron** en
+ * la ventana (período), no la cadena estática completa. Para análisis de flujo,
+ * OI y muros eso es justo lo relevante — los strikes sin operar no tienen flujo
+ * que interpretar.
+ *
+ * Por contrato nos quedamos con la fila MÁS RECIENTE (OI, precio, volumen y bid
+ * del momento más actual). MarketSnack trae `open_interest` por fila, así que el
+ * OI — que es lo que Massive nos quitó — vuelve por aquí.
+ */
+export async function fetchChainFromFlow(
+  ticker: string,
+  opts: { period?: string; maxPages?: number; onPage?: FetchFlowOptions["onPage"] } = {},
+): Promise<FlowChainResult> {
+  const clean = ticker.trim().toUpperCase();
+  if (!clean) throw new MarketSnackError("Ticker vacío.");
+
+  const { trades, pages, truncated } = await paginate(clean, {
+    period: opts.period ?? "5d",
+    maxPages: opts.maxPages ?? 25,
+    onPage: opts.onPage,
+  });
+
+  // Fila más reciente por contrato (el OI/precio más actual gana).
+  const latest = new Map<string, RawTrade>();
+  let underlyingPrice: number | null = null;
+  for (const t of trades) {
+    if (!parseOcc(t.symbol)) continue;
+    const prev = latest.get(t.symbol);
+    if (!prev || Date.parse(t.timestamp) > Date.parse(prev.timestamp)) {
+      latest.set(t.symbol, t);
+    }
+    if (typeof t.asset_price === "number" && t.asset_price > 0) {
+      underlyingPrice = t.asset_price; // el último visto; trades vienen recientes→viejos
+    }
+  }
+
+  const contracts: RawContract[] = [];
+  for (const [symbol, t] of latest) {
+    const occ = parseOcc(symbol)!;
+    const price = t.price > 0 ? t.price : (t.bid_price > 0 ? t.bid_price : undefined);
+    contracts.push({
+      details: {
+        contract_type: occ.type,
+        expiration_date: occ.expiration,
+        strike_price: occ.strike,
+        shares_per_contract: 100,
+        ticker: symbol,
+      },
+      open_interest: t.open_interest ?? 0,
+      day: { volume: t.volume ?? 0, close: price, vwap: undefined },
+      last_trade: { price },
+      underlying_asset: { price: t.asset_price, ticker: clean },
+    });
+  }
+
+  return { contracts, underlyingPrice, pages, truncated };
+}
+
+export interface FlowWheelQuote {
+  strike: number;
+  expiration: string;
+  dte: number;
+  bid: number | null;
+  ask: number | null;
+  lastTrade: number | null;
+  openInterest: number;
+}
+
+export interface FlowWheelResult {
+  spot: number | null;
+  quotes: FlowWheelQuote[];
+}
+
+/**
+ * Cadena de PUTS para el screener de Wheel, reconstruida desde el flujo de
+ * MarketSnack cuando Massive ya no autoriza su snapshot (403). Preserva el
+ * **bid** (lo que cobras al vender el cash-secured put) y el OI.
+ *
+ * Cobertura: solo puts que operaron en la ventana y caen en [dteMin, dteMax].
+ * Puede ser más rala que la cadena completa de Massive — por eso el Wheel la
+ * marca como respaldo. Filtra a OTM (strike ≤ spot), igual que la ruta Massive.
+ */
+export async function fetchWheelChainFromFlow(
+  ticker: string,
+  opts: { dteMin: number; dteMax: number; now?: Date },
+): Promise<FlowWheelResult> {
+  const clean = ticker.trim().toUpperCase();
+  if (!clean) throw new MarketSnackError("Ticker vacío.");
+  const now = opts.now ?? new Date();
+  const day = 24 * 60 * 60 * 1000;
+  const todayETMs = Date.parse(`${marketDateStr(now)}T00:00:00Z`);
+
+  const { trades } = await paginate(clean, { period: "5d", maxPages: 25 });
+
+  const latest = new Map<string, RawTrade>();
+  let spot: number | null = null;
+  for (const t of trades) {
+    const occ = parseOcc(t.symbol);
+    if (!occ || occ.type !== "put") continue;
+    const prev = latest.get(t.symbol);
+    if (!prev || Date.parse(t.timestamp) > Date.parse(prev.timestamp)) {
+      latest.set(t.symbol, t);
+    }
+    if (typeof t.asset_price === "number" && t.asset_price > 0) spot = t.asset_price;
+  }
+
+  const quotes: FlowWheelQuote[] = [];
+  for (const [symbol, t] of latest) {
+    const occ = parseOcc(symbol)!;
+    const dte = Math.round((Date.parse(`${occ.expiration}T00:00:00Z`) - todayETMs) / day);
+    if (dte < opts.dteMin || dte > opts.dteMax) continue;
+    quotes.push({
+      strike: occ.strike,
+      expiration: occ.expiration,
+      dte,
+      bid: t.bid_price > 0 ? t.bid_price : null,
+      ask: t.ask_price > 0 ? t.ask_price : null,
+      lastTrade: t.price > 0 ? t.price : null,
+      openInterest: t.open_interest ?? 0,
+    });
+  }
+
+  // Solo puts OTM (strike ≤ spot), igual que la ruta de Massive.
+  const otm = spot != null ? quotes.filter((q) => q.strike <= spot!) : quotes;
+  return { spot, quotes: otm };
 }
 
 /** Cuerpo de paginación compartido. `symbol === null` → escaneo de todo el mercado. */
