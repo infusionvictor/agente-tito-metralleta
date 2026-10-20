@@ -2,6 +2,7 @@
 
 import type { CompanyInfo, DailyBar, RawContract, TfBar } from "./types";
 import { marketDateStr } from "./occ";
+import { fetchChainFromFlow, fetchWheelChainFromFlow } from "./marketsnack";
 
 const BASE_URL = "https://api.massive.com";
 
@@ -68,12 +69,17 @@ export async function fetchOptionChain(
 
   while (url) {
     page += 1;
-    const res: Response = await fetch(url, {
-      headers: { Authorization: `Bearer ${key}` },
-      cache: "no-store",
-    });
+    const res: Response = await fetchMassive(url, key);
 
     if (!res.ok) {
+      // El plan ya no autoriza el snapshot de opciones (403): reconstruimos la
+      // cadena desde el flujo de MarketSnack, que sí trae OI/bid/greeks por
+      // contrato. Transparente para el resto del pipeline (misma forma).
+      if (res.status === 403) {
+        return fetchChainFromFlow(clean, {
+          onPage: (p, acc) => progress.onPage?.(p, acc),
+        });
+      }
       const body = await res.text().catch(() => "");
       throw new MassiveError(
         describeStatus(res.status, clean, body),
@@ -101,6 +107,9 @@ export async function fetchOptionChain(
       break;
     }
     url = json.next_url ?? null;
+    // Pausa entre páginas: espacia las llamadas para no reventar el límite/min
+    // de Massive en cadenas grandes (SPY pagina muchas veces).
+    if (url) await new Promise((r) => setTimeout(r, 200));
   }
 
   return { contracts, underlyingPrice, pages: page, truncated };
@@ -118,20 +127,59 @@ interface TickerDetails {
   branding?: { logo_url?: string; icon_url?: string };
 }
 
-interface StockSnapshot {
-  todaysChange?: number;
-  todaysChangePerc?: number;
-  day?: { o?: number; h?: number; l?: number; c?: number; v?: number };
-  min?: { c?: number };
-  prevDay?: { c?: number };
+interface DailyAggBar {
+  t: number; // epoch ms
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v?: number;
+}
+
+/**
+ * Últimas `n` barras diarias (EOD) del subyacente, más reciente primero.
+ *
+ * Reemplaza al stock snapshot en vivo (`/v2/snapshot/...`), que el plan de
+ * Massive dejó de autorizar (403 "upgrade your plan", oct 2026). Las barras
+ * diarias (`/v2/aggs/.../range/1/day`) SÍ siguen entitled, así que el precio
+ * mostrado es el ÚLTIMO CIERRE de mercado (retrasado), no el intradía.
+ */
+async function fetchRecentDaily(clean: string, n = 2): Promise<DailyAggBar[]> {
+  const to = new Date();
+  const from = new Date(to.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const path =
+    `/v2/aggs/ticker/${encodeURIComponent(clean)}/range/1/day/` +
+    `${toDateStr(from.getTime())}/${toDateStr(to.getTime())}` +
+    `?adjusted=true&sort=desc&limit=${n}`;
+  const json = await getJson<{ results?: DailyAggBar[] }>(path).catch(() => null);
+  return json?.results ?? [];
+}
+
+// Cliente HTTP compartido con REINTENTO ante 429: el plan de Massive limita por
+// minuto, y una página con 429 no debe tirar toda la operación. Espera y
+// reintenta (respeta Retry-After si viene; si no, backoff exponencial).
+async function fetchMassive(url: string, key: string): Promise<Response> {
+  const maxAttempts = 4;
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${key}` },
+      cache: "no-store",
+    });
+    if (res.status === 429 && attempt < maxAttempts) {
+      const retryAfter = Number(res.headers.get("retry-after"));
+      const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : 1500 * 2 ** (attempt - 1); // 1.5s → 3s → 6s
+      await new Promise((r) => setTimeout(r, waitMs));
+      continue;
+    }
+    return res;
+  }
 }
 
 async function getJson<T>(path: string): Promise<T | null> {
   const key = apiKey();
-  const res = await fetch(`${BASE_URL}${path}`, {
-    headers: { Authorization: `Bearer ${key}` },
-    cache: "no-store",
-  });
+  const res = await fetchMassive(`${BASE_URL}${path}`, key);
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -140,21 +188,39 @@ async function getJson<T>(path: string): Promise<T | null> {
   return (await res.json()) as T;
 }
 
-/** Detalles de referencia + snapshot de precio, combinados en CompanyInfo. */
+/**
+ * Primer valor POSITIVO de una lista. Massive devuelve `day.c = 0` (no null) temprano en
+ * la sesión o por límites del plan, y `x ?? y` NO salta el 0 → mostraba precio $0 o el
+ * cierre de ayer. Este helper salta null/undefined Y ceros, así que toma el precio real.
+ */
+function primerPositivo(...xs: Array<number | null | undefined>): number | null {
+  for (const x of xs) if (typeof x === "number" && x > 0) return x;
+  return null;
+}
+
+/** Detalles de referencia + precio (último cierre EOD), combinados en CompanyInfo. */
 export async function fetchCompany(ticker: string): Promise<CompanyInfo> {
   const clean = ticker.trim().toUpperCase();
-  const [details, snap] = await Promise.all([
+  const [details, bars] = await Promise.all([
     getJson<{ results?: TickerDetails }>(
       `/v3/reference/tickers/${encodeURIComponent(clean)}`,
     ).catch(() => null),
-    getJson<{ ticker?: StockSnapshot }>(
-      `/v2/snapshot/locale/us/markets/stocks/tickers/${encodeURIComponent(clean)}`,
-    ).catch(() => null),
+    // El snapshot en vivo (`/v2/snapshot/...`) ya no está entitled en el plan;
+    // tomamos el precio de las dos últimas barras diarias (sí funcionan).
+    fetchRecentDaily(clean, 2).catch(() => [] as DailyAggBar[]),
   ]);
 
   const d = details?.results ?? {};
-  const t = snap?.ticker ?? {};
   const exchangeCode = d.primary_exchange;
+
+  // bars viene más reciente primero: [0] = última sesión, [1] = la anterior.
+  // El "precio" es el último cierre de mercado (retrasado) y el cambio es
+  // día-sobre-día. No hay intradía en este plan.
+  const last = bars[0];
+  const prev = bars[1];
+  const px = primerPositivo(last?.c);
+  const prevC = primerPositivo(prev?.c);
+  const derivable = px != null && prevC != null;
 
   return {
     ticker: clean,
@@ -167,14 +233,14 @@ export async function fetchCompany(ticker: string): Promise<CompanyInfo> {
     sector: d.sic_description ?? null,
     description: d.description ?? null,
     hasLogo: Boolean(d.branding?.logo_url || d.branding?.icon_url),
-    price: t.day?.c ?? t.min?.c ?? t.prevDay?.c ?? null,
-    change: t.todaysChange ?? null,
-    changePercent: t.todaysChangePerc ?? null,
-    dayOpen: t.day?.o ?? null,
-    dayHigh: t.day?.h ?? null,
-    dayLow: t.day?.l ?? null,
-    dayVolume: t.day?.v ?? null,
-    prevClose: t.prevDay?.c ?? null,
+    price: px,
+    change: derivable ? px - prevC : null,
+    changePercent: derivable && prevC > 0 ? ((px - prevC) / prevC) * 100 : null,
+    dayOpen: last?.o ?? null,
+    dayHigh: last?.h ?? null,
+    dayLow: last?.l ?? null,
+    dayVolume: last?.v ?? null,
+    prevClose: prevC,
   };
 }
 
@@ -282,6 +348,10 @@ interface WheelRawContract {
   details?: { strike_price?: number; expiration_date?: string; contract_type?: string };
   last_quote?: { bid?: number; ask?: number };
   last_trade?: { price?: number };
+  // Agregado diario del contrato. Massive dejó de exponer last_quote/last_trade
+  // en este plan, pero sigue mandando `day` — su close es el último precio
+  // (retrasado) del put, respaldo para la prima cuando MarketSnack no cotiza.
+  day?: { close?: number; vwap?: number };
   open_interest?: number;
   underlying_asset?: { price?: number };
 }
@@ -306,8 +376,22 @@ export async function fetchWheelChain(
     `/v3/snapshot/options/${encodeURIComponent(clean)}` +
     `?contract_type=put&expiration_date.gte=${from}&expiration_date.lte=${to}&limit=250`;
 
-  const json = await getJson<{ results?: WheelRawContract[] }>(path);
-  const results = json?.results ?? [];
+  let results: WheelRawContract[];
+  try {
+    const json = await getJson<{ results?: WheelRawContract[] }>(path);
+    results = json?.results ?? [];
+  } catch (err) {
+    // El plan ya no autoriza el snapshot (403): reconstruimos los puts desde el
+    // flujo de MarketSnack (preserva bid y OI). Misma forma de salida.
+    if (err instanceof MassiveError && err.status === 403) {
+      return fetchWheelChainFromFlow(clean, {
+        dteMin: opts.dteMin,
+        dteMax: opts.dteMax,
+        now,
+      });
+    }
+    throw err;
+  }
 
   let spot: number | null = null;
   const quotes: WheelChainQuote[] = [];
@@ -328,7 +412,7 @@ export async function fetchWheelChain(
       dte,
       bid: c.last_quote?.bid ?? null,
       ask: c.last_quote?.ask ?? null,
-      lastTrade: c.last_trade?.price ?? null,
+      lastTrade: c.last_trade?.price ?? c.day?.close ?? c.day?.vwap ?? null,
       openInterest: c.open_interest ?? 0,
     });
   }
@@ -341,8 +425,9 @@ export async function fetchWheelChain(
 function describeStatus(status: number, ticker: string, body: string): string {
   switch (status) {
     case 401:
+      return "Autenticación rechazada por Massive (401). Revisa la API key.";
     case 403:
-      return "Autenticación rechazada por Massive. Revisa la API key.";
+      return "Tu plan de Massive no incluye estos datos (403). El option chain y los snapshots en vivo (OI, greeks, precio intradía) requieren un plan superior; las barras diarias, los detalles de empresa y las noticias sí funcionan. Para datos de opciones en vivo usa Robinhood en la sesión del agente.";
     case 404:
       return `Massive no encontró datos para "${ticker}".`;
     case 429:

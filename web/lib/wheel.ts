@@ -88,7 +88,7 @@ export function pickPremium(input: {
 
 // ── Liquidez: la salvaguarda ───────────────────────────────────────────
 
-export type WheelBlockReason = "sin_bid" | "spread_ancho" | "oi_bajo";
+export type WheelBlockReason = "sin_bid" | "spread_ancho" | "oi_bajo" | "sin_dato";
 
 export const MAX_SPREAD_PCT = 25;
 export const MIN_OI = 100;
@@ -378,7 +378,23 @@ export function wheelCandidates(input: CandidatesInput): WheelCandidate[] {
     if (absDelta < preset.deltaMin || absDelta > preset.deltaMax) continue;
 
     const spreadPct = spreadPctOf(q.bid, q.ask);
-    const blockReason = liquidityBlock({ bid: q.bid, ask: q.ask, openInterest: q.openInterest });
+    const hasLiveBid = q.bid != null && q.bid > 0;
+
+    // Salvaguarda de liquidez. Con bid en vivo aplica la regla completa
+    // (spread + OI). Massive dejó de exponer bid/ask en su snapshot, así que
+    // sin bid vivo permitimos operar con el ÚLTIMO precio (retrasado) siempre
+    // que el OI sostenga la liquidez; si no hay ni bid, ni OI, ni último, se
+    // bloquea. La fuente "ultimo" (con recorte) deja claro que es retrasado.
+    let blockReason: WheelBlockReason | null;
+    if (hasLiveBid) {
+      blockReason = liquidityBlock({ bid: q.bid, ask: q.ask, openInterest: q.openInterest });
+    } else if (q.openInterest < MIN_OI) {
+      blockReason = "oi_bajo";
+    } else if (!(q.lastTrade != null && q.lastTrade > 0)) {
+      blockReason = "sin_dato";
+    } else {
+      blockReason = null;
+    }
 
     if (blockReason) {
       // Bloqueado: sin prima y sin métricas. No se enseña un número que no puedes cobrar.

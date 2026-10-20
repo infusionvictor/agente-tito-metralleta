@@ -45,6 +45,7 @@ export default function IdeasPage() {
   const [steps, setSteps] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const esRef = useRef<EventSource | null>(null);
 
   const [watchlist, setWatchlist] = useState<WatchlistEntry[]>([]);
@@ -243,13 +244,17 @@ export default function IdeasPage() {
     window.localStorage.setItem(KEY_HORIZON, String(d));
   };
 
-  const scan = useCallback(() => {
+  // quiet=true (auto-refresco): no borra la tabla actual mientras rescanea, así
+  // los datos viejos se mantienen visibles hasta que llegan los nuevos.
+  const scan = useCallback((quiet = false) => {
     esRef.current?.close();
     setBusy(true);
     setError(null);
-    setSteps([]);
-    setIdeas(null);
-    setMeta(null);
+    if (!quiet) {
+      setSteps([]);
+      setIdeas(null);
+      setMeta(null);
+    }
 
     const es = new EventSource("/api/ideas");
     esRef.current = es;
@@ -261,6 +266,7 @@ export default function IdeasPage() {
       } else if (data.type === "done") {
         setIdeas(data.ideas);
         setMeta(data.meta);
+        setLastUpdated(new Date());
         setBusy(false);
         es.close();
       } else if (data.type === "error") {
@@ -276,9 +282,18 @@ export default function IdeasPage() {
     };
   }, []);
 
+  // Escaneo al montar + AUTO-REFRESCO cada 15 min mientras la pestaña está
+  // visible (silencioso). También refresca al volver a la pestaña si pasó rato.
   useEffect(() => {
     scan();
-    return () => esRef.current?.close();
+    const REFRESH_MS = 15 * 60 * 1000;
+    const id = window.setInterval(() => {
+      if (document.visibilityState === "visible") scan(true);
+    }, REFRESH_MS);
+    return () => {
+      window.clearInterval(id);
+      esRef.current?.close();
+    };
   }, [scan]);
 
   // El sizing se calcula aquí, en el cliente: el servidor nunca ve el saldo.
@@ -351,9 +366,15 @@ export default function IdeasPage() {
             ))}
           </div>
 
-          <button className="rescan" onClick={scan} disabled={busy}>
+          <button className="rescan" onClick={() => scan()} disabled={busy}>
             {busy ? "Escaneando…" : "↻ Volver a escanear"}
           </button>
+
+          {lastUpdated && (
+            <span className="ideas-updated muted" title="Se refresca solo cada 15 minutos mientras la pestaña esté abierta">
+              {busy ? "Actualizando…" : `Actualizado ${lastUpdated.toLocaleTimeString("es", { hour: "2-digit", minute: "2-digit" })} · auto cada 15 min`}
+            </span>
+          )}
         </div>
 
         {busy && (

@@ -226,16 +226,39 @@ describe("wheelCandidates", () => {
     expect(out).toHaveLength(0);
   });
 
-  it("marca como blocked, y sin prima, un contrato ilíquido", () => {
+  it("marca como blocked, y sin prima, un contrato ilíquido (OI insuficiente)", () => {
     const out = wheelCandidates({
       ...CAND_BASE,
       quotes: [quote({ bid: 0, ask: 0.34, openInterest: 5 })],
     });
     expect(out).toHaveLength(1);
     expect(out[0].blocked).toBe(true);
-    expect(out[0].blockReason).toBe("sin_bid");
+    expect(out[0].blockReason).toBe("oi_bajo");
     expect(out[0].premium).toBeNull();
     expect(out[0].metrics).toBeNull();
+  });
+
+  it("sin bid en vivo pero con OI y último precio: opera con prima RETRASADA", () => {
+    // El caso real hoy: Massive dejó de mandar bid/ask, sí manda day.close.
+    const out = wheelCandidates({
+      ...CAND_BASE,
+      quotes: [quote({ bid: null, ask: null, lastTrade: 0.32, openInterest: 900 })],
+    });
+    expect(out).toHaveLength(1);
+    const c = out[0];
+    expect(c.blocked).toBe(false);
+    expect(c.premium?.source).toBe("ultimo");
+    expect(c.metrics).not.toBeNull();
+  });
+
+  it("sin bid, con OI, pero sin ningún precio: bloqueado por falta de datos", () => {
+    const out = wheelCandidates({
+      ...CAND_BASE,
+      quotes: [quote({ bid: null, ask: null, lastTrade: null, openInterest: 900 })],
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].blocked).toBe(true);
+    expect(out[0].blockReason).toBe("sin_dato");
   });
 
   it("un candidato válido trae delta negativo, métricas y score", () => {
