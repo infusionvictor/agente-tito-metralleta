@@ -1,0 +1,45 @@
+name: Piloto automático — escaneo periódico
+
+# Dispara POST /api/autopilot/scan en el despliegue de Vercel cada 15 min,
+# aprox. en horario de mercado de EE.UU. (13:00-21:45 UTC cubre 9:30-16:00 ET
+# tanto en horario de verano como de invierno; correr algo fuera de ventana
+# los días de mercado cerrado no hace daño, solo un escaneo de más).
+#
+# Requiere tres secrets en este repo (Settings → Secrets and variables → Actions):
+#   TITO_DEPLOY_URL     → ej. https://tu-proyecto.vercel.app
+#   CRON_SECRET         → el mismo valor que CRON_SECRET en las env vars de Vercel
+#   DISCORD_WEBHOOK_URL → mismo valor que en web/.env.local (avisa si el scan falla)
+#
+# Minutos 7/22/37/52 en vez de */15 (0/15/30/45) a propósito: el minuto :00
+# es el más saturado de TODA la cola de cron de GitHub Actions (recomendación
+# oficial de GitHub) — en este repo (fork público, poca actividad) medimos
+# corridas retrasadas 2-3h+ y ventanas enteras saltadas. No lo elimina, pero
+# ayuda. Ver la nota más larga en morning-digest.yml.
+
+on:
+  schedule:
+    - cron: "7,22,37,52 13-21 * * 1-5"
+  workflow_dispatch: {} # permite dispararlo a mano desde la pestaña Actions
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST /api/autopilot/scan
+        run: |
+          curl -sS -X POST "${TITO_DEPLOY_URL}/api/autopilot/scan" \
+            -H "x-cron-secret: ${CRON_SECRET}" \
+            -w "\nHTTP %{http_code}\n" \
+            --fail-with-body
+        env:
+          TITO_DEPLOY_URL: ${{ secrets.TITO_DEPLOY_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+      - name: Avisar por Discord si el escaneo falló
+        if: failure()
+        run: |
+          curl -sS -X POST "${DISCORD_WEBHOOK_URL}" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"⚠️ **Piloto automático falló** — /api/autopilot/scan devolvió error en la corrida de $(date -u +%H:%M) UTC. Revisa los logs en la pestaña Actions.\"}" \
+            -w "\nHTTP %{http_code}\n"
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}

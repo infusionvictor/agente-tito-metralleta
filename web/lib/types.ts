@@ -20,6 +20,11 @@ export interface RawContract {
   last_trade?: {
     price?: number;
   };
+  /** SÍ viene en el plan actual (verificado jul 2026); `greeks`/`implied_volatility` no. */
+  last_quote?: {
+    bid?: number;
+    ask?: number;
+  };
   open_interest?: number;
   underlying_asset?: {
     price?: number;

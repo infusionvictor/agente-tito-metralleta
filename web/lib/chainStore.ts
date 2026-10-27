@@ -3,9 +3,9 @@
 // momento: no hay serie histórica de open interest. Por eso guardamos una foto por
 // día de mercado y el historial se va acumulando hacia adelante. Solo servidor.
 
-import { promises as fs } from "fs";
 import path from "path";
 import { marketDateStr } from "./occ";
+import { loadJson, saveJson } from "./persist";
 import type { StructureScore } from "./structure";
 
 const DATA_DIR = path.join(process.cwd(), "data", "chain");
@@ -43,14 +43,13 @@ function fileFor(ticker: string): string {
   return path.join(DATA_DIR, `${safe}.json`);
 }
 
+function keyFor(ticker: string): string {
+  return `chain:${ticker.trim().toUpperCase()}`;
+}
+
 export async function loadChainHistory(ticker: string): Promise<ChainHistory | null> {
-  try {
-    const raw = await fs.readFile(fileFor(ticker), "utf8");
-    const parsed = JSON.parse(raw) as ChainHistory;
-    return Array.isArray(parsed.snapshots) ? parsed : null;
-  } catch {
-    return null;
-  }
+  const parsed = await loadJson<ChainHistory>(fileFor(ticker), keyFor(ticker));
+  return parsed && Array.isArray(parsed.snapshots) ? parsed : null;
 }
 
 /**
@@ -96,7 +95,6 @@ export async function saveChainSnapshot(
     .slice(0, HISTORY_DAYS);
 
   const payload: ChainHistory = { ticker: clean, updatedAt: now.toISOString(), snapshots };
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(fileFor(clean), JSON.stringify(payload), "utf8");
+  await saveJson(fileFor(clean), keyFor(clean), payload);
   return payload;
 }

@@ -1,0 +1,45 @@
+name: Resumen matutino — oportunidades reales
+
+# Dispara POST /api/digest/morning en el despliegue de Vercel antes de la
+# apertura del mercado. Ese endpoint escanea TODO el mercado con el mismo
+# filtro de calidad que /ideas (lib/risk.ts) y manda el resumen por Discord —
+# nunca inventa oportunidades: si el escaneo falla, avisa el motivo real.
+#
+# SOLO disparo manual aquí (workflow_dispatch) — el disparo diario real vive
+# en vercel.json (Vercel Cron Jobs), NO en el `schedule:` de este workflow.
+# Comprobado (sep 2026): el scheduler de GitHub Actions en este repo (fork
+# público, poca actividad) retrasa los cron 2-3h+ e incluso salta ventanas
+# enteras (autopilot-scan.yml, cron cada 15 min en horario de mercado, tuvo
+# un solo día con 4 corridas reales en vez de ~32, la última fuera de la
+# ventana declarada) — por eso el resumen de las 9am nunca llegaba. Vercel
+# Cron corre en la infraestructura de Vercel, no en la cola de Actions.
+#
+# Requiere los mismos secrets que autopilot-scan.yml (Settings → Secrets and
+# variables → Actions): TITO_DEPLOY_URL, CRON_SECRET, DISCORD_WEBHOOK_URL.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST /api/digest/morning
+        run: |
+          curl -sS -X POST "${TITO_DEPLOY_URL}/api/digest/morning" \
+            -H "x-cron-secret: ${CRON_SECRET}" \
+            -w "\nHTTP %{http_code}\n" \
+            --fail-with-body \
+            --max-time 60
+        env:
+          TITO_DEPLOY_URL: ${{ secrets.TITO_DEPLOY_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+      - name: Avisar por Discord si la petición en sí falló (deploy caído, etc.)
+        if: failure()
+        run: |
+          curl -sS -X POST "${DISCORD_WEBHOOK_URL}" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"⚠️ **Resumen matutino no se pudo generar** — /api/digest/morning no respondió. Revisa los logs en la pestaña Actions.\"}" \
+            -w "\nHTTP %{http_code}\n"
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}

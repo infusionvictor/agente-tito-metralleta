@@ -3,10 +3,10 @@
 // la vende. Igual que con la cadena, guardamos una foto por día de mercado para que
 // el rank real vaya reemplazando al proxy de volatilidad realizada. Solo servidor.
 
-import { promises as fs } from "fs";
 import path from "path";
 import { marketDateStr } from "./occ";
 import type { IvContextScore } from "./ivcontext";
+import { loadJson, saveJson } from "./persist";
 
 const DATA_DIR = path.join(process.cwd(), "data", "iv");
 
@@ -34,14 +34,13 @@ function fileFor(ticker: string): string {
   return path.join(DATA_DIR, `${safe}.json`);
 }
 
+function keyFor(ticker: string): string {
+  return `iv:${ticker.trim().toUpperCase()}`;
+}
+
 export async function loadIvHistory(ticker: string): Promise<IvHistory | null> {
-  try {
-    const raw = await fs.readFile(fileFor(ticker), "utf8");
-    const parsed = JSON.parse(raw) as IvHistory;
-    return Array.isArray(parsed.snapshots) ? parsed : null;
-  } catch {
-    return null;
-  }
+  const parsed = await loadJson<IvHistory>(fileFor(ticker), keyFor(ticker));
+  return parsed && Array.isArray(parsed.snapshots) ? parsed : null;
 }
 
 /** Guarda la IV del día (una por fecha de mercado) y devuelve el historial recortado. */
@@ -77,7 +76,6 @@ export async function saveIvSnapshot(
     .slice(0, IV_HISTORY_DAYS);
 
   const payload: IvHistory = { ticker: clean, updatedAt: now.toISOString(), snapshots };
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(fileFor(clean), JSON.stringify(payload), "utf8");
+  await saveJson(fileFor(clean), keyFor(clean), payload);
   return payload;
 }

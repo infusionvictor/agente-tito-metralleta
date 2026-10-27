@@ -7,10 +7,10 @@
 // `fetchDailyBars` sigue sin cache para el resto de rutas: este store es
 // nuevo y en v1 solo lo usa Wheel.
 
-import { promises as fs } from "fs";
 import path from "path";
 import { marketDateStr } from "./occ";
 import { fetchDailyBars } from "./massive";
+import { loadJson, saveJson } from "./persist";
 import type { DailyBar } from "./types";
 
 const DATA_DIR = path.join(process.cwd(), "data", "bars");
@@ -27,19 +27,17 @@ function fileFor(ticker: string): string {
   return path.join(DATA_DIR, `${safe}.json`);
 }
 
+function keyFor(ticker: string): string {
+  return `bars:${ticker.trim().toUpperCase()}`;
+}
+
 export async function loadBars(ticker: string): Promise<BarsFile | null> {
-  try {
-    const raw = await fs.readFile(fileFor(ticker), "utf8");
-    return JSON.parse(raw) as BarsFile;
-  } catch {
-    return null;
-  }
+  return loadJson<BarsFile>(fileFor(ticker), keyFor(ticker));
 }
 
 export async function saveBars(ticker: string, bars: DailyBar[], now = new Date()): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
   const payload: BarsFile = { ticker: ticker.toUpperCase(), date: marketDateStr(now), bars };
-  await fs.writeFile(fileFor(ticker), JSON.stringify(payload), "utf8");
+  await saveJson(fileFor(ticker), keyFor(ticker), payload);
 }
 
 /** Barras diarias con cache de un día de mercado. Si falla la red, devuelve []. */

@@ -10,8 +10,9 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.4",
     "lightweight-charts": "^4.2.3",
-    "next": "15.1.6",
+    "next": "^15.5.22",
     "react": "19.0.0",
     "react-dom": "19.0.0"
   },
@@ -20,6 +21,10 @@
     "@types/react": "19.0.7",
     "@types/react-dom": "19.0.3",
     "typescript": "5.7.3",
-    "vitest": "3.0.4"
+    "vitest": "^3.2.7"
+  },
+  "overrides": {
+    "postcss": "8.5.23",
+    "sharp": "^0.35.0"
   }
 }

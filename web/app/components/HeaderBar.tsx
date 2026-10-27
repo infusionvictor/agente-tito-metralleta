@@ -1,11 +1,68 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { CompanyInfo } from "@/lib/types";
 import { pct, px } from "../format";
 import NavTabs from "./NavTabs";
 
 const QUICK = ["TSLA", "NVDA", "SPY", "AAPL"];
+
+/**
+ * Botón de vigilancia proactiva de niveles (ver /api/watch/scan): avisa por
+ * Discord si el precio cruza de verdad un soporte/resistencia real de este
+ * ticker, sin que tengas que estar mirando la pantalla. Complementa el
+ * escaneo de todo el mercado (/ideas, resumen matutino) — es la "lupa" para
+ * lo que ya decidiste que te importa.
+ */
+function WatchToggle({ ticker }: { ticker: string }) {
+  const [watched, setWatched] = useState<boolean | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setErr(null);
+    fetch("/api/watch")
+      .then((r) => r.json())
+      .then((j) => { if (!cancelled) setWatched((j.tickers ?? []).includes(ticker)); })
+      .catch(() => { if (!cancelled) setWatched(false); });
+    return () => { cancelled = true; };
+  }, [ticker]);
+
+  const toggle = async () => {
+    setErr(null);
+    try {
+      if (watched) {
+        const r = await fetch(`/api/watch?ticker=${encodeURIComponent(ticker)}`, { method: "DELETE" });
+        const j = await r.json();
+        setWatched((j.tickers ?? []).includes(ticker));
+      } else {
+        const r = await fetch("/api/watch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ticker }),
+        });
+        const j = await r.json();
+        if (!r.ok) { setErr(j?.error ?? "No se pudo agregar."); return; }
+        setWatched((j.tickers ?? []).includes(ticker));
+      }
+    } catch {
+      setErr("Error de red.");
+    }
+  };
+
+  if (watched == null) return null;
+  return (
+    <button
+      type="button"
+      className="hb-tab"
+      title={err ?? (watched ? `Dejar de vigilar ${ticker}` : `Avisar por Discord si ${ticker} rompe un nivel real`)}
+      style={watched ? { background: "#eef2ff", color: "#4338ca" } : undefined}
+      onClick={toggle}
+    >
+      {watched ? "👁 Vigilando" : "👁 Vigilar"}
+    </button>
+  );
+}
 
 export default function HeaderBar({
   ticker,
@@ -67,6 +124,7 @@ export default function HeaderBar({
             )}
           </>
         )}
+        {ticker && <WatchToggle ticker={ticker} />}
       </div>
     </div>
   );

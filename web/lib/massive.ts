@@ -2,6 +2,7 @@
 
 import type { CompanyInfo, DailyBar, RawContract, TfBar } from "./types";
 import { marketDateStr } from "./occ";
+import { NEAR_SPOT_PCT } from "./gex";
 
 const BASE_URL = "https://api.massive.com";
 
@@ -32,6 +33,28 @@ function apiKey(): string {
 function maxPages(): number {
   const n = Number(process.env.MASSIVE_MAX_PAGES);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 40;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Reintentos SOLO para 429 (límite de tasa) — es lo único que se arregla solo
+ * con esperar; 401/403/404 van a fallar igual la próxima vez. Backoff corto:
+ * la mayoría de estos límites de Massive se liberan en 1-2 segundos.
+ */
+const RATE_LIMIT_RETRIES = 2;
+const RATE_LIMIT_DELAYS_MS = [800, 1600];
+
+/** Fetch con reintento de 429 — comparten esta parte fetchOptionChain, fetchNearChain y getJson. */
+async function fetchWithRateLimitRetry(url: string, key: string): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${key}` }, cache: "no-store" });
+    if (res.status === 429 && attempt < RATE_LIMIT_RETRIES) {
+      await sleep(RATE_LIMIT_DELAYS_MS[attempt]);
+      continue;
+    }
+    return res;
+  }
 }
 
 export interface FetchProgress {
@@ -68,10 +91,7 @@ export async function fetchOptionChain(
 
   while (url) {
     page += 1;
-    const res: Response = await fetch(url, {
-      headers: { Authorization: `Bearer ${key}` },
-      cache: "no-store",
-    });
+    const res: Response = await fetchWithRateLimitRetry(url, key);
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -128,10 +148,7 @@ interface StockSnapshot {
 
 async function getJson<T>(path: string): Promise<T | null> {
   const key = apiKey();
-  const res = await fetch(`${BASE_URL}${path}`, {
-    headers: { Authorization: `Bearer ${key}` },
-    cache: "no-store",
-  });
+  const res = await fetchWithRateLimitRetry(`${BASE_URL}${path}`, key);
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -199,7 +216,13 @@ export async function fetchDailyBars(ticker: string, days = 365): Promise<DailyB
     `/v2/aggs/ticker/${encodeURIComponent(clean)}/range/1/day/` +
     `${toDateStr(from.getTime())}/${toDateStr(to.getTime())}` +
     `?adjusted=true&sort=asc&limit=500`;
-  const json = await getJson<{ results?: AggBar[] }>(path).catch(() => null);
+  // Sin .catch acá a propósito: swallowear el error da un array vacío "exitoso"
+  // indistinguible de "no hay barras", y GEX/niveles/predicción se quedan mudos
+  // para siempre sin ningún aviso (bug real, visto con Massive fallando en
+  // silencio bajo carga). Cada caller decide cómo manejar el fallo — la mayoría
+  // encadena su propio `.catch(() => [])`; `/api/history` lo deja propagar para
+  // devolver un 502 real en vez de fingir que no hay datos.
+  const json = await getJson<{ results?: AggBar[] }>(path);
   const bars = json?.results ?? [];
   return bars.map((b) => ({
     time: toDateStr(b.t),
@@ -224,7 +247,10 @@ export async function fetchBars(
     `/v2/aggs/ticker/${encodeURIComponent(clean)}/range/${multiplier}/${timespan}/` +
     `${toDateStr(from.getTime())}/${toDateStr(to.getTime())}` +
     `?adjusted=true&sort=asc&limit=50000`;
-  const json = await getJson<{ results?: AggBar[] }>(path).catch(() => null);
+  // Mismo motivo que fetchDailyBars: no swallowear el error acá — /api/bars ya
+  // lo convierte en un 502 real en vez de un array vacío indistinguible de
+  // "no hay datos".
+  const json = await getJson<{ results?: AggBar[] }>(path);
   const bars = json?.results ?? [];
   return bars.map((b) => ({
     time: Math.floor(b.t / 1000),
@@ -338,11 +364,137 @@ export async function fetchWheelChain(
   return { spot, quotes: otm };
 }
 
+export interface NearChainResult {
+  spot: number | null;
+  /** Ambos lados (call y put), acotados a ±NEAR_SPOT_PCT del spot. */
+  contracts: RawContract[];
+  truncated: boolean;
+}
+
+/**
+ * Cadena acotada para el piloto automático (GEX + niveles): trae ambos lados dentro
+ * de la ventana de vencimiento, igual que `fetchWheelChain`, y filtra por strike
+ * DESPUÉS de conocer el spot real (mismo motivo: no se puede acotar por strike antes
+ * de tener un precio de referencia sin gastar una llamada aparte). `maxPages` acota
+ * el costo por ticker — el piloto escanea ~40 tickers por corrida.
+ */
+export async function fetchNearChain(
+  ticker: string,
+  opts: { dteMax: number; now?: Date; maxPages?: number },
+): Promise<NearChainResult> {
+  const clean = ticker.trim().toUpperCase();
+  if (!clean) throw new MassiveError("Ticker vacío.");
+  const now = opts.now ?? new Date();
+  const day = 24 * 60 * 60 * 1000;
+  const todayET = marketDateStr(now);
+  const todayETMs = Date.parse(`${todayET}T00:00:00Z`);
+  const to = toDateStr(todayETMs + opts.dteMax * day);
+  const limit = opts.maxPages ?? 3;
+
+  const key = apiKey();
+  const contracts: RawContract[] = [];
+  let spot: number | null = null;
+  let url: string | null =
+    `${BASE_URL}/v3/snapshot/options/${encodeURIComponent(clean)}` +
+    `?expiration_date.lte=${to}&limit=250`;
+  let page = 0;
+  let truncated = false;
+
+  while (url) {
+    page += 1;
+    const res: Response = await fetchWithRateLimitRetry(url, key);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new MassiveError(describeStatus(res.status, clean, body), res.status);
+    }
+    const json: { results?: RawContract[]; next_url?: string } = await res.json();
+    for (const c of json.results ?? []) {
+      contracts.push(c);
+      if (spot === null && typeof c.underlying_asset?.price === "number") {
+        spot = c.underlying_asset.price;
+      }
+    }
+    if (page >= limit) {
+      truncated = Boolean(json.next_url);
+      break;
+    }
+    url = json.next_url ?? null;
+  }
+
+  if (spot == null) return { spot: null, contracts: [], truncated };
+
+  const lo = spot * (1 - NEAR_SPOT_PCT);
+  const hi = spot * (1 + NEAR_SPOT_PCT);
+  const near = contracts.filter((c) => {
+    const k = c.details?.strike_price;
+    return k != null && k >= lo && k <= hi;
+  });
+
+  return { spot, contracts: near, truncated };
+}
+
+export interface ContractQuote {
+  underlyingPrice: number | null;
+  bid: number | null;
+  ask: number | null;
+  lastTrade: number | null;
+  /** Precio a usar para monitorear el trade: mid si hay bid/ask, si no el último trade. */
+  mid: number | null;
+}
+
+interface ContractRawResult {
+  last_quote?: { bid?: number; ask?: number };
+  last_trade?: { price?: number };
+  underlying_asset?: { price?: number };
+}
+
+/**
+ * Cotización de UN contrato exacto (para monitorear un paper trade). Filtra en el
+ * servidor por tipo/strike/vencimiento, igual que `fetchWheelChain`, así que un
+ * ticker cabe en una sola llamada en vez de traer la cadena completa.
+ */
+export async function fetchContractQuote(
+  ticker: string,
+  contractType: "call" | "put",
+  strike: number,
+  expiration: string,
+): Promise<ContractQuote | null> {
+  const clean = ticker.trim().toUpperCase();
+  if (!clean) throw new MassiveError("Ticker vacío.");
+  const path =
+    `/v3/snapshot/options/${encodeURIComponent(clean)}` +
+    `?contract_type=${contractType}&expiration_date=${expiration}` +
+    `&strike_price=${strike}&limit=1`;
+
+  const json = await getJson<{ results?: ContractRawResult[] }>(path);
+  const c = json?.results?.[0];
+  if (!c) return null;
+
+  const bid = c.last_quote?.bid ?? null;
+  const ask = c.last_quote?.ask ?? null;
+  const lastTrade = c.last_trade?.price ?? null;
+  const mid = bid != null && ask != null ? (bid + ask) / 2 : lastTrade;
+
+  return {
+    underlyingPrice: c.underlying_asset?.price ?? null,
+    bid,
+    ask,
+    lastTrade,
+    mid,
+  };
+}
+
 function describeStatus(status: number, ticker: string, body: string): string {
   switch (status) {
     case 401:
-    case 403:
-      return "Autenticación rechazada por Massive. Revisa la API key.";
+      return "Massive rechazó la API key (401): no es válida o no se envió. Revisa MASSIVE_API_KEY en .env.local.";
+    case 403: {
+      const detail = body.slice(0, 200).trim();
+      return (
+        `Massive bloqueó el acceso (403): la key es válida pero no tiene permiso para este endpoint ` +
+        `(plan sin datos de opciones, rate limit u otra restricción de cuenta).${detail ? ` Detalle: ${detail}` : ""}`
+      );
+    }
     case 404:
       return `Massive no encontró datos para "${ticker}".`;
     case 429:

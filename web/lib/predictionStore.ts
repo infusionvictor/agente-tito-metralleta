@@ -7,9 +7,9 @@
 // que es la materia prima para ir mejorando los targets. Solo servidor (fs), pero la
 // lógica de revisión es PURA (tests en predictionStore.test.ts).
 
-import { promises as fs } from "fs";
 import path from "path";
 import { marketDateStr } from "./occ";
+import { loadJson, saveJson } from "./persist";
 
 const DATA_DIR = path.join(process.cwd(), "data", "predictions");
 /** Cuántas fotos guardar por ticker. */
@@ -72,6 +72,10 @@ function fileFor(ticker: string): string {
   return path.join(DATA_DIR, `${safe}.json`);
 }
 
+function keyFor(ticker: string): string {
+  return `predictions:${ticker.trim().toUpperCase()}`;
+}
+
 function addCalendarDays(dateStr: string, days: number): string {
   const d = new Date(`${dateStr}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + days);
@@ -79,13 +83,8 @@ function addCalendarDays(dateStr: string, days: number): string {
 }
 
 export async function loadJournal(ticker: string): Promise<PredictionJournal | null> {
-  try {
-    const raw = await fs.readFile(fileFor(ticker), "utf8");
-    const parsed = JSON.parse(raw) as PredictionJournal;
-    return Array.isArray(parsed.snapshots) ? parsed : null;
-  } catch {
-    return null;
-  }
+  const parsed = await loadJson<PredictionJournal>(fileFor(ticker), keyFor(ticker));
+  return parsed && Array.isArray(parsed.snapshots) ? parsed : null;
 }
 
 /** Guarda la foto del día (una por fecha de mercado; se reemplaza si ya existe). */
@@ -108,8 +107,7 @@ export async function savePrediction(
     .slice(0, JOURNAL_DAYS);
 
   const payload: PredictionJournal = { ticker: clean, updatedAt: now.toISOString(), snapshots };
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(fileFor(clean), JSON.stringify(payload), "utf8");
+  await saveJson(fileFor(clean), keyFor(clean), payload);
   return payload;
 }
 

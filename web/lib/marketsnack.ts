@@ -131,3 +131,57 @@ async function paginate(
 
   return { trades, pages: page, truncated };
 }
+
+export interface MarketSentiment {
+  /** % del premium de hoy que fue en calls, 0-100. */
+  callPct: number;
+  putPct: number;
+  /** Premium absoluto de hoy, para dar contexto de qué tan activo está el día. */
+  callPremium: number;
+  putPremium: number;
+  /** Promedio reciente de MarketSnack, para comparar si hoy es un día atípico. */
+  avgCallPremium: number;
+  avgPutPremium: number;
+}
+
+/**
+ * Sentimiento de TODO el mercado (no un ticker) — % de premium en calls vs puts hoy.
+ * Endpoint: /api/widgets/market_sentiment?period=1d. Sirve de contexto macro: si el
+ * flujo de un ticker específico va a favor o en contra de la corriente general del
+ * mercado. No toca el scorecard por ticker, es un dato aparte.
+ */
+export async function fetchMarketSentiment(): Promise<MarketSentiment> {
+  const cookieHeader = cookie();
+  const url = `${BASE_URL}/api/widgets/market_sentiment?period=1d`;
+
+  const res = await fetch(url, {
+    headers: { Accept: "application/json", Cookie: cookieHeader },
+    cache: "no-store",
+    redirect: "manual",
+  });
+
+  if (res.status === 401 || res.status === 403 || (res.status >= 300 && res.status < 400)) {
+    throw new MarketSnackError(
+      "Sesión de MarketSnack inválida o expirada. Actualiza MARKETSNACK_COOKIE en .env.local.",
+      res.status,
+    );
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new MarketSnackError(`MarketSnack respondió ${res.status}. ${body.slice(0, 200)}`.trim(), res.status);
+  }
+
+  const json: { values?: { C?: number; P?: number }; average?: { C?: number; P?: number } } = await res.json();
+  const callPremium = json.values?.C ?? 0;
+  const putPremium = json.values?.P ?? 0;
+  const total = callPremium + putPremium;
+
+  return {
+    callPct: total > 0 ? (callPremium / total) * 100 : 50,
+    putPct: total > 0 ? (putPremium / total) * 100 : 50,
+    callPremium,
+    putPremium,
+    avgCallPremium: json.average?.C ?? 0,
+    avgPutPremium: json.average?.P ?? 0,
+  };
+}

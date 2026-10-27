@@ -1,0 +1,43 @@
+name: Chequeo diario — cookie de MarketSnack
+
+# La cookie de sesión de MarketSnack (MARKETSNACK_COOKIE en Vercel) caduca/rota
+# sin aviso previo — no hay forma de saber la fecha exacta de antemano (ver
+# .github/MARKETSNACK_COOKIE_RENEWAL.md). Este workflow no predice la caducidad,
+# solo la detecta lo antes posible: pega diario a /api/flow (que usa esa cookie)
+# y si la respuesta trae el error de sesión inválida, avisa por Discord.
+#
+# Requiere dos secrets ya usados por autopilot-scan.yml (TITO_DEPLOY_URL) y uno
+# nuevo (DISCORD_WEBHOOK_URL, mismo valor que en web/.env.local).
+
+on:
+  schedule:
+    # :13 en vez de :00 — el minuto :00 es el más saturado de la cola de cron
+    # de GitHub Actions (recomendación oficial de GitHub); medimos esta misma
+    # corrida llegando 2-3h tarde con `0 13 * * *`. Ver morning-digest.yml.
+    - cron: "13 13 * * *" # ~13:00 UTC ≈ 9:00 ET, antes de la apertura del mercado
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probar /api/flow con un ticker líquido
+        run: |
+          BODY=$(curl -sS "${TITO_DEPLOY_URL}/api/flow?ticker=SPY" --max-time 30 || true)
+          echo "$BODY"
+          if echo "$BODY" | grep -q "invalida o expirada"; then
+            echo "cookie_dead=true" >> "$GITHUB_ENV"
+          else
+            echo "cookie_dead=false" >> "$GITHUB_ENV"
+          fi
+      - name: Avisar por Discord si la cookie ya no sirve
+        if: env.cookie_dead == 'true'
+        run: |
+          curl -sS -X POST "${DISCORD_WEBHOOK_URL}" \
+            -H "Content-Type: application/json" \
+            -d '{"content":"⚠️ **MARKETSNACK_COOKIE expirada** — el sub-agente Time & Sales/swing dejó de funcionar. Renueva la cookie en Vercel (ver .github/MARKETSNACK_COOKIE_RENEWAL.md) y redespliega."}' \
+            -w "\nHTTP %{http_code}\n"
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+    env:
+      TITO_DEPLOY_URL: ${{ secrets.TITO_DEPLOY_URL }}

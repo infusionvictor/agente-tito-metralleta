@@ -5,12 +5,12 @@
 // del estudiante. Aquí solo cae la identidad del contrato (ticker y, si el broker los
 // acepta, tipo/strike/vencimiento), que es lo mínimo para resolverlo en el broker.
 
-import { promises as fs } from "fs";
 import path from "path";
+import { loadJson, saveJson } from "./persist";
 import type { OutboxItem } from "./watchlist";
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const FILE = path.join(DATA_DIR, "outbox.json");
+const FILE = path.join(process.cwd(), "data", "outbox.json");
+const KEY = "outbox";
 
 export interface StoredOutbox {
   updatedAt: string;
@@ -20,18 +20,12 @@ export interface StoredOutbox {
 const EMPTY: StoredOutbox = { updatedAt: "", items: [] };
 
 export async function loadOutbox(): Promise<StoredOutbox> {
-  try {
-    const raw = await fs.readFile(FILE, "utf8");
-    const parsed = JSON.parse(raw) as StoredOutbox;
-    return Array.isArray(parsed.items) ? { ...EMPTY, ...parsed } : EMPTY;
-  } catch {
-    return EMPTY; // aún no hay nada encolado
-  }
+  const parsed = await loadJson<StoredOutbox>(FILE, KEY);
+  return parsed && Array.isArray(parsed.items) ? { ...EMPTY, ...parsed } : EMPTY;
 }
 
 export async function saveOutbox(items: OutboxItem[]): Promise<StoredOutbox> {
   const payload: StoredOutbox = { updatedAt: new Date().toISOString(), items };
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(FILE, JSON.stringify(payload, null, 2), "utf8");
+  await saveJson(FILE, KEY, payload);
   return payload;
 }

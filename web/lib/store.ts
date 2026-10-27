@@ -2,9 +2,9 @@
 // con el tiempo (nota del Scorecard: "crea un lugar donde almacenar esta información").
 // Un archivo JSON por ticker en web/data/trades/. Solo servidor.
 
-import { promises as fs } from "fs";
 import path from "path";
 import type { FlowRow } from "./flow";
+import { loadJson, saveJson } from "./persist";
 
 const DATA_DIR = path.join(process.cwd(), "data", "trades");
 
@@ -28,14 +28,13 @@ function fileFor(ticker: string): string {
   return path.join(DATA_DIR, `${safe}.json`);
 }
 
+function keyFor(ticker: string): string {
+  return `trades:${ticker.trim().toUpperCase()}`;
+}
+
 export async function loadTrades(ticker: string): Promise<StoredTrades | null> {
-  try {
-    const raw = await fs.readFile(fileFor(ticker), "utf8");
-    const parsed = JSON.parse(raw) as StoredTrades;
-    return Array.isArray(parsed.trades) ? parsed : null;
-  } catch {
-    return null; // aún no hay historial para este ticker
-  }
+  const parsed = await loadJson<StoredTrades>(fileFor(ticker), keyFor(ticker));
+  return parsed && Array.isArray(parsed.trades) ? parsed : null;
 }
 
 /**
@@ -64,8 +63,7 @@ export async function saveTrades(ticker: string, rows: FlowRow[]): Promise<SaveR
     trades: merged,
   };
 
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(fileFor(clean), JSON.stringify(payload), "utf8");
+  await saveJson(fileFor(clean), keyFor(clean), payload);
 
   const oldest = merged[merged.length - 1]?.timestamp ?? null;
   return { total: merged.length, added, firstSeen: oldest };
