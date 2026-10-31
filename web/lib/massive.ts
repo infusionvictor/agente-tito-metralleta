@@ -156,6 +156,32 @@ export async function fetchCompany(ticker: string): Promise<CompanyInfo> {
   const t = snap?.ticker ?? {};
   const exchangeCode = d.primary_exchange;
 
+  // Precio del subyacente. El snapshot en vivo (`/v2/snapshot/...`) requiere el plan
+  // de Stocks; si no está disponible (403 → snap null) O con el mercado cerrado devuelve
+  // `day.c = 0`, caemos al cierre previo (plan gratis). Usamos `||` a propósito: un 0 no
+  // es un precio, así que debe saltar al siguiente candidato (evita el bug del $0.00).
+  let price = t.day?.c || t.min?.c || t.prevDay?.c || null;
+  let dayOpen = t.day?.o ?? null;
+  let dayHigh = t.day?.h ?? null;
+  let dayLow = t.day?.l ?? null;
+  let dayVolume = t.day?.v ?? null;
+  let prevClose = t.prevDay?.c ?? null;
+
+  if (!price) {
+    const prev = await getJson<{ results?: AggBar[] }>(
+      `/v2/aggs/ticker/${encodeURIComponent(clean)}/prev?adjusted=true`,
+    ).catch(() => null);
+    const p = prev?.results?.[0];
+    if (p) {
+      price = p.c ?? null;
+      dayOpen = p.o ?? null;
+      dayHigh = p.h ?? null;
+      dayLow = p.l ?? null;
+      dayVolume = p.v ?? null;
+      prevClose = p.c ?? null;
+    }
+  }
+
   return {
     ticker: clean,
     name: d.name ?? null,
@@ -167,14 +193,14 @@ export async function fetchCompany(ticker: string): Promise<CompanyInfo> {
     sector: d.sic_description ?? null,
     description: d.description ?? null,
     hasLogo: Boolean(d.branding?.logo_url || d.branding?.icon_url),
-    price: t.day?.c ?? t.min?.c ?? t.prevDay?.c ?? null,
+    price,
     change: t.todaysChange ?? null,
     changePercent: t.todaysChangePerc ?? null,
-    dayOpen: t.day?.o ?? null,
-    dayHigh: t.day?.h ?? null,
-    dayLow: t.day?.l ?? null,
-    dayVolume: t.day?.v ?? null,
-    prevClose: t.prevDay?.c ?? null,
+    dayOpen,
+    dayHigh,
+    dayLow,
+    dayVolume,
+    prevClose,
   };
 }
 
@@ -184,6 +210,7 @@ interface AggBar {
   h: number;
   l: number;
   c: number;
+  v?: number;
 }
 
 function toDateStr(ms: number): string {
@@ -336,6 +363,120 @@ export async function fetchWheelChain(
   // Solo puts OTM: los ITM no son cash-secured puts de Wheel, son otra cosa.
   const otm = spot != null ? quotes.filter((q) => q.strike <= spot) : quotes;
   return { spot, quotes: otm };
+}
+
+export interface ChainQuote {
+  strike: number;
+  type: "call" | "put";
+  /** cierre del día o último trade, por acción. */
+  price: number;
+  /** delta firmado (puts negativo); null si el plan no lo trae. */
+  delta: number | null;
+  /** IV en decimal (0.68 = 68%); null si no viene. */
+  iv: number | null;
+  oi: number;
+  /** ms de la última actualización del contrato (para detectar data stale). */
+  lastUpdatedMs: number | null;
+}
+
+export interface ChainQuotesResult {
+  quotes: ChainQuote[];
+  expiration: string;
+  dte: number;
+  spot: number | null;
+}
+
+interface ChainRawContract {
+  details?: { strike_price?: number; expiration_date?: string; contract_type?: string };
+  day?: { close?: number; last_updated?: number };
+  last_trade?: { price?: number };
+  greeks?: { delta?: number };
+  implied_volatility?: number;
+  open_interest?: number;
+  underlying_asset?: { price?: number };
+}
+
+/**
+ * Cadena near-money del vencimiento más cercano (≥2 días, para evitar 0DTE), con delta.
+ * Una sola llamada que alimenta tanto el straddle ATM (move implícito) como el sugeridor
+ * de spreads. Ver lib/earningsMove.ts y lib/premiumSell.ts.
+ */
+export async function fetchChainQuotes(
+  ticker: string,
+  spot: number | null,
+): Promise<ChainQuotesResult | null> {
+  const clean = ticker.trim().toUpperCase();
+  if (!clean) return null;
+  const day = 24 * 60 * 60 * 1000;
+  const todayETMs = Date.parse(`${marketDateStr(new Date())}T00:00:00Z`);
+  const from = toDateStr(todayETMs + 2 * day);
+  const to = toDateStr(todayETMs + 45 * day);
+  // Rango amplio: los spreads necesitan alas bien OTM (fuera del 1σ de earnings).
+  const strikeFilter =
+    spot && spot > 0
+      ? `&strike_price.gte=${Math.floor(spot * 0.6)}&strike_price.lte=${Math.ceil(spot * 1.4)}`
+      : "";
+  const path =
+    `/v3/snapshot/options/${encodeURIComponent(clean)}` +
+    `?expiration_date.gte=${from}&expiration_date.lte=${to}${strikeFilter}&limit=250`;
+
+  const json = await getJson<{ results?: ChainRawContract[] }>(path).catch(() => null);
+  const results = json?.results ?? [];
+  if (results.length === 0) return null;
+
+  const exps = [
+    ...new Set(results.map((c) => c.details?.expiration_date).filter(Boolean) as string[]),
+  ].sort();
+  const target = exps[0];
+  if (!target) return null;
+  const atExp = results.filter((c) => c.details?.expiration_date === target);
+
+  const s =
+    spot && spot > 0
+      ? spot
+      : atExp.find((c) => c.underlying_asset?.price)?.underlying_asset?.price ?? null;
+
+  const quotes: ChainQuote[] = [];
+  for (const c of atExp) {
+    const strike = c.details?.strike_price;
+    const type = c.details?.contract_type;
+    const price = c.day?.close ?? c.last_trade?.price ?? 0;
+    if (
+      !(strike != null && strike > 0) ||
+      (type !== "call" && type !== "put") ||
+      price <= 0
+    )
+      continue;
+    quotes.push({
+      strike,
+      type,
+      price,
+      delta: c.greeks?.delta ?? null,
+      iv: c.implied_volatility ?? null,
+      oi: c.open_interest ?? 0,
+      // Massive entrega el timestamp en nanosegundos → a ms.
+      lastUpdatedMs: c.day?.last_updated ? Math.round(c.day.last_updated / 1e6) : null,
+    });
+  }
+
+  const dte = Math.round((Date.parse(`${target}T00:00:00Z`) - todayETMs) / day);
+  return { quotes, expiration: target, dte, spot: s };
+}
+
+/**
+ * Fechas de earnings pasadas (proxy: `filing_date` de los estados financieros trimestrales
+ * de Massive). Fuente aislada a propósito para mejorarla luego (ver spec).
+ */
+export async function fetchEarningsDates(ticker: string): Promise<string[]> {
+  const clean = ticker.trim().toUpperCase();
+  if (!clean) return [];
+  const json = await getJson<{ results?: { filing_date?: string }[] }>(
+    `/vX/reference/financials?ticker=${encodeURIComponent(clean)}&limit=16&timeframe=quarterly`,
+  ).catch(() => null);
+  const dates = (json?.results ?? [])
+    .map((r) => r.filing_date)
+    .filter((d): d is string => Boolean(d));
+  return [...new Set(dates)].sort();
 }
 
 function describeStatus(status: number, ticker: string, body: string): string {

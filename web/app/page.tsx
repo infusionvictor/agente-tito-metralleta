@@ -37,6 +37,7 @@ import ConvictionTransactions, { type ConvictionMeta } from "./components/Convic
 import UnusualityCard, { type UnusualityMeta, type UnusualRow } from "./components/UnusualityCard";
 import StructureCard from "./components/StructureCard";
 import IvContextCard from "./components/IvContextCard";
+import EarningsCard from "./components/EarningsCard";
 import ValidationCard from "./components/ValidationCard";
 import FlowPriceChart from "./components/FlowPriceChart";
 import OptionChainTable from "./components/OptionChainTable";
@@ -417,6 +418,8 @@ export default function Dashboard() {
               <SentimentCard ticker={ticker} parts={sentimentParts} />
               <PredictionCard ticker={ticker} prediction={prediction} horizonDays={horizonDays} onHorizon={setHorizonDays} topFlows={topFlows} />
             </div>
+
+            <EarningsCard ticker={ticker} />
 
             {convRows && convRows.length > 0 && unusuality && (
               <div className="grid-2">
